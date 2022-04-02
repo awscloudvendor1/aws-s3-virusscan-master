@@ -1,0 +1,874 @@
+---
+# Copyright 2018 widdix GmbH
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Security: S3 VirusScan, a cloudonaut.io template'
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+    - Label:
+        default: 'Parent Stacks'
+      Parameters:
+      - ParentVPCStack
+      - ParentSSHBastionStack
+    - Label:
+        default: 'Scan Parameters'
+      Parameters:
+      - DeleteInfectedFiles
+      - ReportCleanFiles
+      - TagFiles
+      - TagKey
+      - S3BucketRestriction
+      - S3ObjectRestriction
+    - Label:
+        default: 'Auto Scaling Group Parameters'
+      Parameters:
+      - AutoScalingMinSize
+      - AutoScalingMaxSize
+    - Label:
+        default: 'EC2 Parameters'
+      Parameters:
+      - KeyName
+      - IAMUserSSHAccess
+      - InstanceType
+      - SpotPrice
+      - LogsRetentionInDays
+      - VolumeSize
+Parameters:
+  ParentVPCStack:
+    Description: 'Stack name of parent VPC stack based on vpc/vpc-*azs.yaml template.'
+    Type: String
+  ParentSSHBastionStack:
+    Description: 'Optional stack name of parent SSH bastion host/instance stack based on vpc/vpc-ssh-bastion.yaml template.'
+    Type: String
+    Default: ''
+  S3BucketRestriction:
+    Description: 'Restrict access to specific S3 buckets (e.g. arn:aws:s3:::s3-virusscan-a,arn:aws:s3:::s3-virusscan-b or * to allow access to all S3 buckets).'
+    Type: CommaDelimitedList
+    Default: '*'
+  S3ObjectRestriction:
+    Description: 'Restrict access to specific S3 objects (e.g. arn:aws:s3:::s3-virusscan-a/*,arn:aws:s3:::s3-virusscan-b/* or * to allow access to all S3 objects).'
+    Type: CommaDelimitedList
+    Default: '*'
+  DeleteInfectedFiles:
+    Description: 'Automatically delete infected files'
+    Type: String
+    Default: true
+    AllowedValues:
+    - true
+    - false
+  ReportCleanFiles:
+    Description: 'Report successful scan of clean, as well as infected files to the SNS topic'
+    Type: String
+    Default: false
+    AllowedValues:
+    - true
+    - false
+  TagFiles:
+    Description: 'Tag S3 object upon successful scan accordingly with values of "clean" or "infected" (only if DeleteInfectedFiles != false) using key specified by TagKey.'
+    Type: String
+    Default: false
+    AllowedValues:
+    - true
+    - false
+  TagKey:
+    Description: 'S3 object tag key used to specify values of "clean" or "infected".'
+    Type: String
+    Default: 'clamav-status'
+  AutoScalingMinSize:
+    Description: 'Min Size for Auto Scaling'
+    Type: Number
+    Default: 1
+    ConstraintDescription: 'Must be >= 0'
+    MinValue: 0
+  AutoScalingMaxSize:
+    Description: 'Max Size for Auto Scaling'
+    Type: Number
+    Default: 1
+    ConstraintDescription: 'Must be >= 1'
+    MinValue: 1
+  KeyName:
+    Description: 'Optional provide an EC2 key pair if you want to login via SSH'
+    Type: String
+    Default: ''
+  IAMUserSSHAccess:
+    Description: 'Synchronize public keys of IAM users to enable personalized SSH access (Doc: https://cloudonaut.io/manage-aws-ec2-ssh-access-with-iam/).'
+    Type: String
+    Default: false
+    AllowedValues:
+    - true
+    - false
+  InstanceType:
+    Description: 'Specifies the instance type of the EC2 instance'
+    Type: String
+    Default: 't2.small'
+  SpotPrice:
+    Description: 'Optional spot price (leave empty to start on-demand instances).'
+    Type: String
+    AllowedPattern: '[0-9\.]*'
+    ConstraintDescription: 'Must be a positive number'
+    Default: ''
+  LogsRetentionInDays:
+    Description: 'Specifies the number of days you want to retain log events.'
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+  VolumeSize:
+    Description: The size of the volume, in gibibytes (GiBs).
+    Type: Number
+    Default: 8
+    ConstraintDescription: 'Must be in the range [8-1024]'
+    MinValue: 8
+    MaxValue: 1024
+Conditions:
+  HasKeyName: !Not [!Equals [!Ref KeyName, '']]
+  HasIAMUserSSHAccess: !Equals [!Ref IAMUserSSHAccess, 'true']
+  HasSSHBastionSecurityGroup: !Not [!Equals [!Ref ParentSSHBastionStack, '']]
+  HasNotSSHBastionSecurityGroup: !Equals [!Ref ParentSSHBastionStack, '']
+  HasDeleteInfectedFiles: !Equals [!Ref DeleteInfectedFiles, 'true']
+  HasTagFiles: !Equals [!Ref TagFiles, 'true']
+  HasSpotPrice: !Not [!Equals [!Ref SpotPrice, '']]
+Mappings:
+  RegionMap:
+    'ap-south-1':
+      AMI: 'ami-531a4c3c'
+    'eu-west-3':
+      AMI: 'ami-8ee056f3'
+    'eu-west-2':
+      AMI: 'ami-403e2524'
+    'eu-west-1':
+      AMI: 'ami-d834aba1'
+    'ap-northeast-2':
+      AMI: 'ami-863090e8'
+    'ap-northeast-1':
+      AMI: 'ami-ceafcba8'
+    'sa-east-1':
+      AMI: 'ami-84175ae8'
+    'ca-central-1':
+      AMI: 'ami-a954d1cd'
+    'ap-southeast-1':
+      AMI: 'ami-68097514'
+    'ap-southeast-2':
+      AMI: 'ami-942dd1f6'
+    'eu-central-1':
+      AMI: 'ami-5652ce39'
+    'us-east-1':
+      AMI: 'ami-97785bed'
+    'us-east-2':
+      AMI: 'ami-f63b1193'
+    'us-west-1':
+      AMI: 'ami-824c4ee2'
+    'us-west-2':
+      AMI: 'ami-f2d3638a'
+Resources:
+  FindingsTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties: {}
+  ScanQueue:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      VisibilityTimeout: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt 'ScanQueueDLQ.Arn'
+        maxReceiveCount: 3
+  ScanQueueFullAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmActions:
+      - !Ref ScanScaleUp
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+      - Name: QueueName
+        Value: !GetAtt 'ScanQueue.QueueName'
+      EvaluationPeriods: 2
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: 'AWS/SQS'
+      Period: 300
+      Statistic: Sum
+      Threshold: 0
+  ScanQueueEmptyAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmActions:
+      - !Ref ScanScaleDown
+      ComparisonOperator: LessThanOrEqualToThreshold
+      Dimensions:
+      - Name: QueueName
+        Value: !GetAtt 'ScanQueue.QueueName'
+      EvaluationPeriods: 2
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: 'AWS/SQS'
+      Period: 300
+      Statistic: Sum
+      Threshold: 0
+  ScanQueuePolicy:
+    Type: 'AWS::SQS::QueuePolicy'
+    Properties:
+      PolicyDocument:
+        Version: '2008-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS: '*'
+          Action: 'SQS:SendMessage'
+          Resource: !GetAtt 'ScanQueue.Arn'
+      Queues:
+      - !Ref ScanQueue
+  ScanQueueDLQ:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      MessageRetentionPeriod: 1209600
+  ScanQueueDLQAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: 'Alarm if dead letter queue has messages'
+      Namespace: 'AWS/SQS'
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+      - Name: QueueName
+        Value: !GetAtt 'ScanQueueDLQ.QueueName'
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+      - !Ref FindingsTopic
+  ScanQueueOldMessagesAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: 'Alarm if scan queue contains a message older than 1 hour'
+      Namespace: 'AWS/SQS'
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+      - Name: QueueName
+        Value: !GetAtt 'ScanQueue.QueueName'
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 3600 # 1 hour
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+      - !Ref FindingsTopic
+  ScanAutoScalingGroup:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Properties:
+      DesiredCapacity: !Ref AutoScalingMinSize
+      LaunchConfigurationName: !Ref ScanLaunchConfiguration
+      MaxSize: !Ref AutoScalingMaxSize
+      MinSize: !Ref AutoScalingMinSize
+      VPCZoneIdentifier:
+      - 'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetAPublic'
+      - 'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetBPublic'
+      Tags:
+      - Key: Name
+        Value: !Ref 'AWS::StackName'
+        PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        PauseTime: PT10M
+        WaitOnResourceSignals: true
+  ScanScaleUp:
+    Type: 'AWS::AutoScaling::ScalingPolicy'
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref ScanAutoScalingGroup
+      Cooldown: 300
+      ScalingAdjustment: 1
+  ScanScaleDown:
+    Type: 'AWS::AutoScaling::ScalingPolicy'
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref ScanAutoScalingGroup
+      Cooldown: 300
+      ScalingAdjustment: -1
+  ScanInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Roles:
+      - !Ref ScanIAMRole
+  ScanIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 'ec2.amazonaws.com'
+          Action: sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: s3read
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - 's3:GetObject*'
+            Resource: !Ref S3ObjectRestriction
+          - Effect: Allow
+            Action:
+            - 's3:ListBucket*'
+            Resource: !Ref S3BucketRestriction
+      - PolicyName: sqs
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - 'sqs:DeleteMessage'
+            - 'sqs:ReceiveMessage'
+            Resource: !GetAtt 'ScanQueue.Arn'
+      - PolicyName: sns
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: 'sns:Publish'
+            Resource: !Ref FindingsTopic
+      - PolicyName: logs
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - 'logs:CreateLogGroup'
+            - 'logs:CreateLogStream'
+            - 'logs:PutLogEvents'
+            - 'logs:DescribeLogStreams'
+            Resource: 'arn:aws:logs:*:*:*'
+  DeletePolicy:
+    Type: 'AWS::IAM::Policy'
+    Condition: HasDeleteInfectedFiles
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - 's3:DeleteObject*'
+          Resource: !Ref S3ObjectRestriction
+      PolicyName: s3delete
+      Roles:
+      - !Ref ScanIAMRole
+  TagObjectPolicy:
+    Type: 'AWS::IAM::Policy'
+    Condition: HasTagFiles
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action: 's3:PutObjectTagging'
+          Resource: !Ref S3ObjectRestriction
+          Condition:
+            'ForAllValues:StringLike':
+              's3:RequestObjectTagKeys': !Ref TagKey
+      PolicyName: s3objecttag
+      Roles:
+      - !Ref ScanIAMRole
+  ScanIAMPolicySSHAccess:
+    Type: 'AWS::IAM::Policy'
+    Condition: HasIAMUserSSHAccess
+    Properties:
+      Roles:
+      - !Ref ScanIAMRole
+      PolicyName: iam
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - 'iam:ListUsers'
+          Resource:
+          - '*'
+        - Effect: Allow
+          Action:
+          - 'iam:ListSSHPublicKeys'
+          - 'iam:GetSSHPublicKey'
+          Resource:
+          - !Sub 'arn:aws:iam::${AWS::AccountId}:user/*'
+  Logs:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      RetentionInDays: !Ref LogsRetentionInDays
+  ScanLaunchConfiguration:
+    Type: 'AWS::AutoScaling::LaunchConfiguration'
+    Metadata:
+      'AWS::CloudFormation::Init':
+        configSets:
+          default: !If [HasIAMUserSSHAccess, [awslogs, ssh-access, config], [awslogs, config]]
+        awslogs:
+          packages:
+            yum:
+              awslogs: []
+          files:
+            '/etc/awslogs/awscli.conf':
+              content: !Sub |
+                [default]
+                region = ${AWS::Region}
+                [plugins]
+                cwlogs = cwlogs
+              mode: '000644'
+              owner: root
+              group: root
+            '/etc/awslogs/awslogs.conf':
+              content: !Sub |
+                [general]
+                state_file = /var/lib/awslogs/agent-state
+                [/var/log/awslogs.log]
+                datetime_format = %Y-%m-%d %H:%M:%S
+                file = /var/log/awslogs.log
+                log_stream_name = {instance_id}/var/log/awslogs.log
+                log_group_name = ${Logs}
+                [/var/log/messages]
+                datetime_format = %b %d %H:%M:%S
+                file = /var/log/messages
+                log_stream_name = {instance_id}/var/log/messages
+                log_group_name = ${Logs}
+                [/var/log/secure]
+                datetime_format = %b %d %H:%M:%S
+                file = /var/log/secure
+                log_stream_name = {instance_id}/var/log/secure
+                log_group_name = ${Logs}
+                [/var/log/cron]
+                datetime_format = %b %d %H:%M:%S
+                file = /var/log/cron
+                log_stream_name = {instance_id}/var/log/cron
+                log_group_name = ${Logs}
+                [/var/log/cloud-init.log]
+                datetime_format = %b %d %H:%M:%S
+                file = /var/log/cloud-init.log
+                log_stream_name = {instance_id}/var/log/cloud-init.log
+                log_group_name = ${Logs}
+                [/var/log/cfn-init.log]
+                datetime_format = %Y-%m-%d %H:%M:%S
+                file = /var/log/cfn-init.log
+                log_stream_name = {instance_id}/var/log/cfn-init.log
+                log_group_name = ${Logs}
+                [/var/log/cfn-hup.log]
+                datetime_format = %Y-%m-%d %H:%M:%S
+                file = /var/log/cfn-hup.log
+                log_stream_name = {instance_id}/var/log/cfn-hup.log
+                log_group_name = ${Logs}
+                [/var/log/cfn-init-cmd.log]
+                datetime_format = %Y-%m-%d %H:%M:%S
+                file = /var/log/cfn-init-cmd.log
+                log_stream_name = {instance_id}/var/log/cfn-init-cmd.log
+                log_group_name = ${Logs}
+                [/var/log/cloud-init-output.log]
+                file = /var/log/cloud-init-output.log
+                log_stream_name = {instance_id}/var/log/cloud-init-output.log
+                log_group_name = ${Logs}
+                [/var/log/dmesg]
+                file = /var/log/dmesg
+                log_stream_name = {instance_id}/var/log/dmesg
+                log_group_name = ${Logs}
+              mode: '000644'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              awslogs:
+                enabled: true
+                ensureRunning: true
+                packages:
+                  yum:
+                  - awslogs
+                files:
+                - '/etc/awslogs/awslogs.conf'
+                - '/etc/awslogs/awscli.conf'
+        ssh-access:
+          files:
+            '/opt/authorized_keys_command.sh':
+              content: |
+                #!/bin/bash -e
+                if [ -z "$1" ]; then
+                  exit 1
+                fi
+                SaveUserName="$1"
+                SaveUserName=${SaveUserName//"+"/".plus."}
+                SaveUserName=${SaveUserName//"="/".equal."}
+                SaveUserName=${SaveUserName//","/".comma."}
+                SaveUserName=${SaveUserName//"@"/".at."}
+                aws iam list-ssh-public-keys --user-name "$SaveUserName" --query "SSHPublicKeys[?Status == 'Active'].[SSHPublicKeyId]" --output text | while read KeyId; do
+                  aws iam get-ssh-public-key --user-name "$SaveUserName" --ssh-public-key-id "$KeyId" --encoding SSH --query "SSHPublicKey.SSHPublicKeyBody" --output text
+                done
+              mode: '000755'
+              owner: root
+              group: root
+            '/opt/import_users.sh':
+              content: |
+                #!/bin/bash -e
+                aws iam list-users --query "Users[].[UserName]" --output text | while read User; do
+                  SaveUserName="$User"
+                  SaveUserName=${SaveUserName//"+"/".plus."}
+                  SaveUserName=${SaveUserName//"="/".equal."}
+                  SaveUserName=${SaveUserName//","/".comma."}
+                  SaveUserName=${SaveUserName//"@"/".at."}
+                  if [ "${#SaveUserName}" -le "32" ]; then
+                    if ! id -u "$SaveUserName" >/dev/null 2>&1; then
+                      #sudo will read each file in /etc/sudoers.d, skipping file names that end in ‘~’ or contain a ‘.’ character to avoid causing problems with package manager or editor temporary/backup files.
+                      SaveUserFileName=$(echo "$SaveUserName" | tr "." " ")
+                      /usr/sbin/useradd "$SaveUserName"
+                      echo "$SaveUserName ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$SaveUserFileName"
+                    fi
+                  else
+                    echo "Can not import IAM user ${SaveUserName}. User name is longer than 32 characters."
+                  fi
+                done
+              mode: '000755'
+              owner: root
+              group: root
+            '/etc/cron.d/import_users':
+              content: |
+                */10 * * * * root /opt/import_users.sh
+              mode: '000644'
+              owner: root
+              group: root
+          commands:
+            'a_configure_sshd_command':
+              command: 'sed -i "s:#AuthorizedKeysCommand none:AuthorizedKeysCommand /opt/authorized_keys_command.sh:g" /etc/ssh/sshd_config'
+            'b_configure_sshd_commanduser':
+              command: 'sed -i "s:#AuthorizedKeysCommandUser nobody:AuthorizedKeysCommandUser nobody:g" /etc/ssh/sshd_config'
+            'c_import_users':
+              command: './import_users.sh'
+              cwd: '/opt'
+          services:
+            sysvinit:
+              sshd:
+                enabled: true
+                ensureRunning: true
+                commands:
+                - 'a_configure_sshd_command'
+                - 'b_configure_sshd_commanduser'
+        config:
+          packages:
+            yum:
+              clamd: []
+              clamav-update: []
+            rubygems:
+              aws-sdk: ['2.11.33']
+              daemons: ['1.2.4']
+              rubysl-securerandom: ['2.0.0']
+          files:
+            '/opt/aws-s3-virusscan/daemon.rb':
+              content: |
+                #!/usr/bin/env ruby
+                require 'daemons'
+                Daemons.run(__dir__ + '/worker.rb', {:monitor => true, :log_output_syslog => true})
+              mode: '000744'
+              owner: root
+              group: root
+            '/opt/aws-s3-virusscan/worker.rb':
+              content: |
+                #!/usr/bin/env ruby
+                require 'aws-sdk'
+                require 'json'
+                require 'uri'
+                require 'yaml'
+                require 'syslog/logger'
+                require 'securerandom'
+
+                class ClamScanWorker
+
+                  attr_reader :log, :conf, :sns, :tag_key, :clean_tag_set, :infected_tag_set
+
+                  CLEAN_STATUS = 'clean'
+                  INFECTED_STATUS = 'infected'
+
+                  def initialize
+                    @log = Syslog::Logger.new 's3-virusscan'
+                    @conf = YAML::load_file(__dir__ + '/s3-virusscan.conf')
+                    Aws.config.update(region: conf['region'])
+                    @tag_key = conf['tag_key']
+                    @clean_tag_set = {tag_set: [{key: tag_key, value: CLEAN_STATUS}]}
+                    @infected_tag_set = {tag_set: [{key: tag_key, value: INFECTED_STATUS}]}
+                    @sns = Aws::SNS::Client.new()
+                  end
+
+                  def perform
+                    log.info "s3-virusscan started"
+
+                    s3 = Aws::S3::Client.new()
+                    poller = Aws::SQS::QueuePoller.new(conf['queue'])
+
+                    poller.poll do |msg|
+                      begin
+                        body = JSON.parse(msg.body)
+                        if body.key?('Records')
+                          body['Records'].each do |record|
+                            bucket = record['s3']['bucket']['name']
+                            key = URI.decode(record['s3']['object']['key']).gsub('+', ' ')
+                            fileName = "/tmp/#{SecureRandom.uuid}"
+                            log.debug "scanning s3://#{bucket}/#{key}..."
+                            begin
+                              s3.get_object(
+                                response_target: fileName,
+                                bucket: bucket,
+                                key: key
+                              )
+                            rescue Aws::S3::Errors::NoSuchKey
+                              log.debug "s3://#{bucket}/#{key} does no longer exist"
+                              next
+                            end
+                            begin
+                              system("clamdscan #{fileName}")
+                              exitstatus = $?.exitstatus
+                              if exitstatus == 0 # No virus found.
+                                if conf['report_clean']
+                                  publish_notification(bucket, key, CLEAN_STATUS);
+                                else
+                                  log.debug "s3://#{bucket}/#{key} is clean"
+                                end
+                                if conf['tag_files']
+                                  s3.put_object_tagging({
+                                      bucket: bucket,
+                                      key: key,
+                                      tagging: clean_tag_set
+                                  })
+                                end
+                              elsif exitstatus == 1 # Virus(es) found.
+                                publish_notification(bucket, key, INFECTED_STATUS);
+                                if conf['delete']
+                                  s3.delete_object(
+                                    bucket: bucket,
+                                    key: key
+                                  )
+                                  log.debug "s3://#{bucket}/#{key} was deleted"
+                                elsif conf['tag_files']
+                                  s3.put_object_tagging({
+                                      bucket: bucket,
+                                      key: key,
+                                      tagging: infected_tag_set
+                                  })
+                                end
+                              else # An error occured.
+                                raise "s3://#{bucket}/#{key} could not be scanned, clamdscan exit status was #{exitstatus}, retry"
+                              end
+                            ensure
+                              system("rm #{fileName}")
+                            end
+                          end
+                        end
+                      rescue Exception => e
+                        log.error "message failed: #{e.inspect} #{msg.inspect}"
+                        raise e
+                      end
+                    end
+                  end
+
+                  private
+
+                  def publish_notification(bucket, key, status)
+                    msg = "s3://#{bucket}/#{key} is #{status}"
+                    if status == INFECTED_STATUS and conf['delete']
+                      msg << ", deleting..."
+                    end
+                    log.debug msg
+                    sns.publish(
+                      topic_arn: conf['topic'],
+                      message: msg,
+                      subject: "s3-virusscan s3://#{bucket}",
+                      message_attributes: {
+                        "key" => {
+                          data_type: "String",
+                          string_value: key
+                        },
+                        "status" => {
+                          data_type: "String",
+                          string_value: status
+                        }
+                      }
+                    )
+                  end
+
+                end
+
+                # do some work
+                ClamScanWorker.new.perform
+              mode: '000744'
+              owner: root
+              group: root
+            '/opt/aws-s3-virusscan/s3-virusscan.conf':
+              content: !Sub |
+                delete: ${DeleteInfectedFiles}
+                report_clean: ${ReportCleanFiles}
+                tag_files: ${TagFiles}
+                tag_key: ${TagKey}
+                region: ${AWS::Region}
+                queue: ${ScanQueue}
+                topic: ${FindingsTopic}
+              mode: '000644'
+              owner: root
+              group: root
+            '/etc/init.d/s3-virusscan':
+              content: |
+                #!/usr/bin/env ruby
+                # chkconfig:    - 80 20
+                APP_NAME = 's3-virusscan'
+                APP_PATH = '/opt/aws-s3-virusscan/daemon.rb'
+                case ARGV.first
+                  when 'start'
+                    puts "Starting #{APP_NAME}..."
+                    system(APP_PATH, 'start')
+                    exit($?.exitstatus)
+                  when 'stop'
+                    system(APP_PATH, 'stop')
+                    exit($?.exitstatus)
+                  when 'restart'
+                    system(APP_PATH, 'restart')
+                    exit($?.exitstatus)
+                  when 'status'
+                    system(APP_PATH, 'status')
+                    exit($?.exitstatus)
+                end
+                unless %w{start stop restart status}.include? ARGV.first
+                  puts "Usage: #{APP_NAME} {start|stop|restart|status}"
+                  exit(1)
+                end
+              mode: '000755'
+              owner: root
+              group: root
+            '/etc/cfn/cfn-hup.conf':
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+                interval=1
+              mode: '000400'
+              owner: root
+              group: root
+            '/etc/cfn/hooks.d/cfn-auto-reloader.conf':
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.ScanLaunchConfiguration.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource ScanLaunchConfiguration --region ${AWS::Region}
+                runas=root
+          commands:
+            a_enable_freshclam_cron:
+              command: 'sed -i "s/^FRESHCLAM_DELAY/#FRESHCLAM_DELAY/g" /etc/sysconfig/freshclam'
+            b_enable_freshclam:
+              command: 'sed -i "s/^Example/#Example/g" /etc/freshclam.conf'
+            c_prepare_local_sopcket:
+              command: 'mkdir /var/run/clamd.scan && chown clamscan:clamscan /var/run/clamd.scan'
+              test: '[ ! -d /var/run/clamd.scan ]'
+            d_enable_clamd_scan:
+              command: 'sed -i "s/^Example/#Example/g;s/^#LocalSocket /LocalSocket /g" /etc/clamd.d/scan.conf'
+            e_add_clamdscan_config:
+              command: 'ln -s /etc/clamd.d/scan.conf /etc/clamd.conf'
+              test: '[ ! -f /etc/clamd.conf ]'
+            f_update_clamav_db:
+              command: freshclam
+          services:
+            sysvinit:
+              's3-virusscan':
+                enabled: true
+                ensureRunning: true
+                files:
+                - '/opt/aws-s3-virusscan/daemon.rb'
+                - '/opt/aws-s3-virusscan/worker.rb'
+                - '/opt/aws-s3-virusscan/s3-virusscan.conf'
+                - '/etc/init.d/s3-virusscan'
+              'clamd.scan':
+                enabled: true
+                ensureRunning: true
+                packages:
+                  yum:
+                  - clamd
+                files:
+                - '/etc/clamd.conf'
+              'cfn-hup':
+                enabled: true
+                ensureRunning: true
+                files:
+                - '/etc/cfn/cfn-hup.conf'
+                - '/etc/cfn/hooks.d/cfn-auto-reloader.conf'
+    Properties:
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref 'AWS::NoValue']
+      AssociatePublicIpAddress: true
+      EbsOptimized: false
+      BlockDeviceMappings:
+      - DeviceName: '/dev/xvda'
+        Ebs:
+          VolumeSize: !Ref VolumeSize
+          VolumeType: gp2
+      IamInstanceProfile: !Ref ScanInstanceProfile
+      ImageId: !FindInMap [RegionMap, !Ref 'AWS::Region', AMI]
+      InstanceType: !Ref InstanceType
+      SpotPrice: !If [HasSpotPrice, !Ref SpotPrice, !Ref 'AWS::NoValue']
+      SecurityGroups:
+      - !Ref ScanSecurityGroup
+      UserData:
+        'Fn::Base64': !Sub |
+          #!/bin/bash -ex
+          trap '/opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource ScanAutoScalingGroup --region ${AWS::Region}' ERR
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource ScanLaunchConfiguration --region ${AWS::Region}
+          /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource ScanAutoScalingGroup --region ${AWS::Region}
+  ScanSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'S3 VirusScan'
+      VpcId:
+        'Fn::ImportValue': !Sub '${ParentVPCStack}-VPC'
+  ScanSecurityGroupInSSHBastion:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Condition: HasSSHBastionSecurityGroup
+    Properties:
+      GroupId: !Ref ScanSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      SourceSecurityGroupId:
+        'Fn::ImportValue': !Sub '${ParentSSHBastionStack}-SecurityGroup'
+  ScanSecurityGroupInAll:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Condition: HasNotSSHBastionSecurityGroup
+    Properties:
+      GroupId: !Ref ScanSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: '0.0.0.0/0'
+Outputs:
+  ScanQueueArn:
+    Description: 'The ARN of the Scan Queue.'
+    Value: !GetAtt 'ScanQueue.Arn'
+    Export:
+      Name: !Sub '${AWS::StackName}-ScanQueueArn'
+  ScanQueueName:
+    Description: 'The name of the Scan Queue.'
+    Value: !GetAtt 'ScanQueue.QueueName'
+    Export:
+      Name: !Sub '${AWS::StackName}-ScanQueueName'
+  ScanQueueUrl:
+    Description: 'The URL of the Scan Queue.'
+    Value: !Ref ScanQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-ScanQueueUrl'
+  FindingsTopicArn:
+    Description: 'The ARN of the Findings Topic.'
+    Value: !Ref FindingsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-FindingsTopicArn'
+  FindingsTopicName:
+    Description: 'The name of the Findings Topic.'
+    Value: !GetAtt 'FindingsTopic.TopicName'
+    Export:
+      Name: !Sub '${AWS::StackName}-FindingsTopicName'
